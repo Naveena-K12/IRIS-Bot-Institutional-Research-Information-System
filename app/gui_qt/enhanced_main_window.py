@@ -24,6 +24,7 @@ from PySide6.QtGui import QFont, QPixmap, QIcon, QColor, QTextOption
 
 from ..config import APP_NAME, DB_BACKEND
 from ..database_unified import get_unified_paper_repository
+from ..integration_manager import get_integration_manager
 from ..utils.enhanced_pdf_extractor import extract_paper_metadata, get_extraction_stats
 from ..utils.metadata_enricher import enrich_paper_metadata
 from ..utils.pdf_opener import open_pdf
@@ -31,6 +32,7 @@ from ..utils.department_manager import get_all_departments, get_departments_for_
 from ..utils.hybrid_search_engine import HybridSearchEngine
 from ..utils.semantic_search_engine import SemanticSearchEngine
 from .smart_verification_dialog import SmartVerificationDialog
+from .duplicate_management_dialog import DuplicateManagementDialog
 from ..utils.pdf_table_generator import generate_paper_table_pdf, generate_summary_pdf
 
 logger = logging.getLogger(__name__)
@@ -490,6 +492,7 @@ class EnhancedMainWindow(QMainWindow):
         
         # Initialize database and repository
         self.paper_repo = get_unified_paper_repository()
+        self.integration_manager = get_integration_manager()
         
         # Initialize search engines
         self.hybrid_search_engine = HybridSearchEngine(self.paper_repo)
@@ -534,6 +537,8 @@ class EnhancedMainWindow(QMainWindow):
         delete_menu.addAction("Delete Selected Paper", self._delete_selected_paper)
         delete_menu.addAction("Delete Selected Papers", self._delete_selected_papers)
         delete_menu.addSeparator()
+        delete_menu.addAction("Delete All Duplicates", self._delete_all_duplicates)
+        delete_menu.addSeparator()
         delete_menu.addAction("Delete All Papers", self._delete_all_papers)
         
         file_menu.addSeparator()
@@ -541,6 +546,8 @@ class EnhancedMainWindow(QMainWindow):
         
         # Tools menu
         tools_menu = menubar.addMenu("Tools")
+        tools_menu.addAction("Manage Duplicates", self._manage_duplicates)
+        tools_menu.addSeparator()
         tools_menu.addAction("Verify Papers", self._verify_papers)
         tools_menu.addAction("Refresh Citations", self._refresh_citations)
         tools_menu.addAction("Update Indexing Status", self._update_indexing_status)
@@ -1141,9 +1148,20 @@ File Path: {paper.file_path}
             metadata = paper.get('metadata', {})
             
             # Store paper ID in the first column for later retrieval
-            title_item = QTableWidgetItem(paper.get('title', ''))
+            is_duplicate = paper.get('is_duplicate', False)
+            title = paper.get('title', '')
+            title_display = f"🔗 {title}" if is_duplicate else title  # Add duplicate indicator
+            title_item = QTableWidgetItem(title_display)
             title_item.setData(Qt.UserRole, paper.get('id'))
             title_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            
+            # Highlight duplicates with background color
+            if is_duplicate:
+                title_item.setBackground(QColor(255, 235, 235))  # Light red background
+                dup_id = paper.get('duplicate_of_id')
+                similarity = paper.get('similarity_score', 0)
+                title_item.setToolTip(f"Duplicate of paper ID: {dup_id}\nSimilarity: {similarity*100:.1f}%")
+            
             self.results_table.setItem(row, 0, title_item)
             
             self.results_table.setItem(row, 1, QTableWidgetItem(paper.get('authors', '')))
@@ -1556,6 +1574,80 @@ File Path: {paper.file_path}
                 
             except Exception as e:
                 QMessageBox.critical(self, "Delete Error", f"Error deleting papers: {e}")
+    
+    def _delete_all_duplicates(self):
+        """Delete all duplicate papers (with confirmation)."""
+        try:
+            # Count duplicates first
+            all_papers = self.paper_repo.search_papers("", limit=10000)
+            duplicates_count = sum(1 for paper in all_papers if paper.get('is_duplicate'))
+            
+            if duplicates_count == 0:
+                QMessageBox.information(
+                    self, "Delete Duplicates", 
+                    "No duplicate papers found in database.\n\nYou may need to run 'Detect Duplicates' first."
+                )
+                return
+            
+            # Confirmation dialog
+            reply = QMessageBox.question(
+                self, "Delete All Duplicates",
+                f"Are you sure you want to delete ALL {duplicates_count} duplicate papers?\n\n"
+                "This will permanently delete papers marked as duplicates.\n"
+                "This action cannot be undone!",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                # Show progress
+                progress = QProgressDialog("Deleting duplicates...", "Cancel", 0, 0, self)
+                progress.setWindowModality(Qt.WindowModal)
+                progress.setWindowTitle("Delete Duplicates")
+                progress.show()
+                
+                # Delete duplicates
+                result = self.integration_manager.delete_duplicates()
+                
+                progress.close()
+                
+                # Show results
+                if 'error' in result:
+                    QMessageBox.critical(
+                        self, "Delete Duplicates Error", 
+                        f"Error deleting duplicates:\n{result['error']}"
+                    )
+                else:
+                    message = f"Deletion completed:\n\n"
+                    message += f"Found: {result['duplicates_found']} duplicates\n"
+                    message += f"Deleted: {result['deleted']} papers\n"
+                    message += f"Failed: {result['failed']} papers"
+                    
+                    if result['failed'] > 0:
+                        QMessageBox.warning(self, "Delete Duplicates", message)
+                    else:
+                        QMessageBox.information(self, "Delete Duplicates", message)
+                    
+                    # Refresh search results
+                    self._perform_search()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Delete Duplicates Error", f"Error deleting duplicates: {e}")
+            logger.error(f"Error deleting duplicates: {e}")
+    
+    def _manage_duplicates(self):
+        """Open duplicate management dialog."""
+        try:
+            dialog = DuplicateManagementDialog(self)
+            dialog.set_integration_manager(self.integration_manager)
+            dialog.exec()
+            
+            # Refresh search results after dialog closes
+            self._perform_search()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error opening duplicate management dialog: {e}")
+            logger.error(f"Error opening duplicate management dialog: {e}")
     
     def _delete_all_papers(self):
         """Delete all papers (with confirmation)."""

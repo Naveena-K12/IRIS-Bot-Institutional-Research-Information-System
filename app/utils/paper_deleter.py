@@ -164,21 +164,13 @@ class PaperDeleter:
             return {'success': 0, 'failed': 1, 'errors': [str(e)]}
     
     def _delete_from_database(self, paper_id: int) -> bool:
-        """Delete paper from database."""
+        """Delete paper from database using repository method."""
         try:
-            # Use raw SQL to delete the paper
-            if hasattr(self.paper_repo, '_execute_query'):
-                # SQLite backend
-                query = "DELETE FROM papers WHERE id = ?"
-                self.paper_repo._execute_query(query, (paper_id,))
-                return True
-            elif hasattr(self.paper_repo, 'db_manager') and hasattr(self.paper_repo.db_manager, 'execute_query'):
-                # PostgreSQL backend
-                query = "DELETE FROM papers WHERE id = %s"
-                self.paper_repo.db_manager.execute_query(query, (paper_id,))
-                return True
+            # Use the repository's delete_paper method
+            if hasattr(self.paper_repo, 'delete_paper'):
+                return self.paper_repo.delete_paper(paper_id)
             else:
-                logger.error("Cannot determine database backend for deletion")
+                logger.error("Repository does not have delete_paper method")
                 return False
                 
         except Exception as e:

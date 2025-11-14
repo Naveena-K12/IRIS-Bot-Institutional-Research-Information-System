@@ -268,3 +268,11 @@ def validate_paper_scholar(title: str, authors: str = "", year: int = 0) -> Scho
 
 
 
+
+
+
+
+
+
+
+

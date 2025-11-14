@@ -11,6 +11,7 @@ import json
 from .database_unified import get_unified_database_manager, get_unified_paper_repository
 from .utils.enhanced_pdf_extractor import extract_paper_metadata, get_extraction_stats
 from .utils.metadata_enricher import enrich_paper_metadata, metadata_enricher
+from .utils.duplicate_detector import duplicate_detector
 from .config import DB_BACKEND, POSTGRES_DSN
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,32 @@ class IntegrationManager:
         except Exception as e:
             logger.warning(f"ML training failed: {e}")
     
+    def _check_for_duplicates(self, paper_data: Dict[str, Any]) -> List[Tuple[int, float, str]]:
+        """
+        Check if a paper has duplicates in the database.
+        
+        Args:
+            paper_data: Paper data dictionary
+            
+        Returns:
+            List of tuples (paper_id, similarity_score, reason) for duplicates found
+        """
+        try:
+            # Get existing papers to check against
+            existing_papers = self.paper_repo.search_papers("", limit=1000)
+            
+            if not existing_papers:
+                return []
+            
+            # Find duplicates
+            duplicates = duplicate_detector.find_duplicates(paper_data, existing_papers)
+            
+            return duplicates
+            
+        except Exception as e:
+            logger.warning(f"Error checking for duplicates: {e}")
+            return []
+    
     def process_pdf_file(self, file_path: str, auto_import: bool = False) -> Dict[str, Any]:
         """
         Process a single PDF file through the complete pipeline.
@@ -124,9 +151,25 @@ class IntegrationManager:
                 'file_path': file_path
             }
             
-            # Step 4: Auto-import if requested
+            # Step 4: Check for duplicates before importing
+            duplicate_info = self._check_for_duplicates(paper_data)
+            if duplicate_info:
+                result['duplicates_found'] = duplicate_info
+                result['has_duplicates'] = True
+                logger.info(f"Found {len(duplicate_info)} potential duplicate(s) for: {extracted.title}")
+            
+            # Step 5: Auto-import if requested (and no duplicates blocking)
             if auto_import:
                 try:
+                    # If duplicates found, mark the new paper as duplicate
+                    if duplicate_info and len(duplicate_info) > 0:
+                        # Mark as duplicate of the first (highest similarity) match
+                        original_id, similarity, reason = duplicate_info[0]
+                        paper_data['is_duplicate'] = True
+                        paper_data['duplicate_of_id'] = original_id
+                        paper_data['similarity_score'] = similarity
+                        logger.info(f"Marking paper as duplicate of {original_id} (similarity: {similarity:.2f})")
+                    
                     paper_id = self.paper_repo.add_paper(paper_data)
                     result['paper_id'] = paper_id
                     result['imported'] = True
@@ -321,6 +364,153 @@ class IntegrationManager:
         except Exception as e:
             logger.error(f"Error exporting to CSV: {e}")
             return False
+    
+    def detect_duplicates_batch(self, limit: int = 1000) -> Dict[str, Any]:
+        """
+        Detect and mark duplicates in the entire database.
+        
+        Args:
+            limit: Maximum number of papers to check
+            
+        Returns:
+            Dictionary with detection results
+        """
+        try:
+            logger.info("Starting batch duplicate detection...")
+            
+            # Get all papers
+            all_papers = self.paper_repo.search_papers("", limit=limit)
+            
+            if len(all_papers) < 2:
+                logger.info("Not enough papers for duplicate detection")
+                return {
+                    'total_papers': len(all_papers),
+                    'duplicates_found': 0,
+                    'papers_checked': 0
+                }
+            
+            duplicates_marked = 0
+            papers_checked = 0
+            
+            for i, paper in enumerate(all_papers):
+                # Skip if already marked as duplicate
+                if paper.get('is_duplicate'):
+                    continue
+                
+                # Check against remaining papers
+                remaining_papers = all_papers[i+1:]
+                duplicates = duplicate_detector.find_duplicates(paper, remaining_papers)
+                
+                papers_checked += 1
+                
+                # Mark the first duplicate found (highest similarity)
+                if duplicates:
+                    duplicate_candidate_id, similarity, reason = duplicates[0]
+                    current_paper_id = paper.get('id')
+                    
+                    # Determine which one to mark as duplicate (keep the one with lower ID, i.e., older one)
+                    if current_paper_id < duplicate_candidate_id:
+                        # Current paper is older, mark the candidate as duplicate
+                        update_data = {
+                            'is_duplicate': True,
+                            'duplicate_of_id': current_paper_id,
+                            'similarity_score': similarity
+                        }
+                        self.paper_repo.update_paper_metadata(duplicate_candidate_id, update_data)
+                        logger.info(f"Marked paper {duplicate_candidate_id} as duplicate of {current_paper_id} (similarity: {similarity:.2f})")
+                    else:
+                        # Candidate is older, mark the current paper as duplicate
+                        update_data = {
+                            'is_duplicate': True,
+                            'duplicate_of_id': duplicate_candidate_id,
+                            'similarity_score': similarity
+                        }
+                        self.paper_repo.update_paper_metadata(current_paper_id, update_data)
+                        logger.info(f"Marked paper {current_paper_id} as duplicate of {duplicate_candidate_id} (similarity: {similarity:.2f})")
+                    
+                    duplicates_marked += 1
+                
+                # Progress logging
+                if papers_checked % 100 == 0:
+                    logger.info(f"Checked {papers_checked}/{len(all_papers)} papers, found {duplicates_marked} duplicates")
+            
+            logger.info(f"Batch duplicate detection completed: {duplicates_marked} duplicates found among {papers_checked} papers checked")
+            
+            return {
+                'total_papers': len(all_papers),
+                'duplicates_found': duplicates_marked,
+                'papers_checked': papers_checked
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in batch duplicate detection: {e}")
+            return {
+                'error': str(e),
+                'total_papers': 0,
+                'duplicates_found': 0,
+                'papers_checked': 0
+            }
+    
+    def delete_duplicates(self, keep_original: bool = True) -> Dict[str, Any]:
+        """
+        Delete papers marked as duplicates.
+        
+        Args:
+            keep_original: If True, keep original papers and delete duplicates. If False, delete originals and keep duplicates.
+            
+        Returns:
+            Dictionary with deletion results
+        """
+        try:
+            logger.info("Starting duplicate deletion...")
+            
+            # Get all duplicate papers
+            all_papers = self.paper_repo.search_papers("", limit=10000)
+            
+            duplicates_to_delete = []
+            for paper in all_papers:
+                if paper.get('is_duplicate'):
+                    duplicates_to_delete.append(paper.get('id'))
+            
+            if not duplicates_to_delete:
+                logger.info("No duplicates found to delete")
+                return {
+                    'duplicates_found': 0,
+                    'deleted': 0,
+                    'failed': 0
+                }
+            
+            deleted_count = 0
+            failed_count = 0
+            
+            for paper_id in duplicates_to_delete:
+                try:
+                    if self.paper_repo.delete_paper(paper_id):
+                        deleted_count += 1
+                        logger.info(f"Deleted duplicate paper {paper_id}")
+                    else:
+                        failed_count += 1
+                        logger.warning(f"Failed to delete duplicate paper {paper_id}")
+                except Exception as e:
+                    failed_count += 1
+                    logger.error(f"Error deleting duplicate paper {paper_id}: {e}")
+            
+            logger.info(f"Duplicate deletion completed: {deleted_count} deleted, {failed_count} failed")
+            
+            return {
+                'duplicates_found': len(duplicates_to_delete),
+                'deleted': deleted_count,
+                'failed': failed_count
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in duplicate deletion: {e}")
+            return {
+                'error': str(e),
+                'duplicates_found': 0,
+                'deleted': 0,
+                'failed': 0
+            }
     
     def close(self):
         """Close database connections."""

@@ -628,7 +628,8 @@ class UnifiedPaperRepository:
 
     def _update_within_session(self, session, paper_id: int, updates: Dict[str, Any]) -> None:
         """Update paper/metadata/citation using an existing session (no commit)."""
-        paper_fields = ['title', 'authors', 'year', 'abstract', 'doi', 'journal', 'publisher', 'file_path', 'full_text']
+        paper_fields = ['title', 'authors', 'year', 'abstract', 'doi', 'journal', 'publisher', 'file_path', 'full_text', 
+                       'is_duplicate', 'duplicate_of_id', 'similarity_score']
         metadata_fields = ['department', 'research_domain', 'paper_type', 'student', 'review_status', 'indexing_status', 'issn', 'published_month']
         citation_fields = ['citation_count', 'scimago_quartile', 'impact_factor', 'h_index', 'citation_source', 'citation_updated_at']
         
