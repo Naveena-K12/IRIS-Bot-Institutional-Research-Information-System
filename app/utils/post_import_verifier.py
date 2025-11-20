@@ -57,6 +57,11 @@ class PostImportVerifier:
         # Verification thresholds
         self.min_confidence = 0.6
         self.high_confidence = 0.8
+
+        # Control whether Google Scholar is used.
+        # For large/batch operations we typically disable it to avoid
+        # hitting rate limits or CAPTCHA / HTML changes that cause errors.
+        self.enable_google_scholar: bool = True
     
     def verify_paper(self, paper: Dict[str, Any]) -> VerificationResult:
         """
@@ -86,8 +91,14 @@ class PostImportVerifier:
             self._verify_by_doi,
             self._verify_by_issn,
             self._verify_by_author_title,
-            self._verify_by_google_scholar
         ]
+
+        # Google Scholar is an unofficial/fragile source; only include it
+        # when explicitly enabled (e.g. for single‑paper checks or very
+        # small batches). For large batches, callers should set
+        # self.enable_google_scholar = False to avoid repeated errors.
+        if self.enable_google_scholar:
+            verification_methods.append(self._verify_by_google_scholar)
         
         for method in verification_methods:
             try:

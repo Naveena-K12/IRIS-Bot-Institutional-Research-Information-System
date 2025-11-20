@@ -43,6 +43,19 @@ class SmartVerificationWorker(QThread):
         try:
             # Filter papers based on verification mode
             papers_to_verify = self._filter_papers_for_verification()
+
+            # Heuristic: disable Google Scholar for larger batches to avoid
+            # repeated errors and rate limiting. It remains enabled for small
+            # batches (e.g. quick manual checks).
+            if hasattr(self.verifier, "enable_google_scholar"):
+                if len(papers_to_verify) > 5:
+                    logger.info(
+                        "Disabling Google Scholar for batch verification of %d papers",
+                        len(papers_to_verify),
+                    )
+                    self.verifier.enable_google_scholar = False
+                else:
+                    self.verifier.enable_google_scholar = True
             
             if not papers_to_verify:
                 self.verification_complete.emit([])
